@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONUTF8: "1"
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -32,13 +35,17 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Build and test
         run: cargo test --all-targets
+      - name: Offline evaluation tests
+        run: |
+          python -m unittest discover -s tools -p "test_*.py"
+          python tools/provider_inventory.py --check
       - name: Build the server binary
         run: cargo build --locked --bin rustxng
       - name: Agent setup smoke test (offline)
         # The script resolves the .exe suffix on Windows.
         run: python tools/smoke_agent_setup.py --binary target/debug/rustxng
       - name: Build the example
-        run: cargo build --release --example benchmark
+        run: cargo build --locked --example benchmark
       - name: Lint the Japanese docs
         if: runner.os == 'Linux'
         run: npx --yes markdownlint-cli2 "*.md" "docs/*.md" 
