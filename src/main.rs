@@ -14,11 +14,14 @@ const HELP: &str = "rustxng - a Rust rewrite of the SearXNG metasearch engine
 
 USAGE:
     rustxng [OPTIONS]
+    rustxng mcp [--config FILE]    Serve MCP tools on stdin/stdout
 
 OPTIONS:
     -c, --config <FILE>    Settings file (default: $SEARXNG_SETTINGS_PATH)
     -b, --bind <ADDRESS>   Address to listen on (default: server.bind_address)
     -p, --port <PORT>      Port to listen on (default: server.port)
+    --check-update        Check the latest official release
+    --update              Download, verify and install the latest release
     -v, --version          Print the version
     -h, --help             Print this help
 
@@ -28,18 +31,26 @@ ENVIRONMENT:
 ";
 
 struct Args {
+    mcp: bool,
     config: Option<PathBuf>,
     bind: Option<String>,
     port: Option<u16>,
+    update: Option<bool>,
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
     let mut args = Args {
+        mcp: false,
         config: None,
         bind: None,
         port: None,
+        update: None,
     };
-    let mut argv = std::env::args().skip(1);
+    let mut argv = std::env::args().skip(1).peekable();
+    if argv.peek().map(String::as_str) == Some("mcp") {
+        argv.next();
+        args.mcp = true;
+    }
     while let Some(argument) = argv.next() {
         match argument.as_str() {
             "-h" | "--help" => {
@@ -49,6 +60,12 @@ fn parse_args() -> Result<Option<Args>, String> {
             "-v" | "--version" => {
                 println!("{}", version_string());
                 return Ok(None);
+            }
+            "--update" | "--check-update" => {
+                if args.update.is_some() {
+                    return Err("choose only one update action".into());
+                }
+                args.update = Some(argument == "--update");
             }
             "-c" | "--config" => {
                 args.config = Some(PathBuf::from(
@@ -78,13 +95,6 @@ fn parse_args() -> Result<Option<Args>, String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,rustxng=debug")),
-        )
-        .init();
-
     let args = match parse_args() {
         Ok(Some(args)) => args,
         Ok(None) => return ExitCode::SUCCESS,
@@ -93,6 +103,29 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    if args.mcp && (args.update.is_some() || args.bind.is_some() || args.port.is_some()) {
+        eprintln!("error: mcp only accepts --config");
+        return ExitCode::from(2);
+    }
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,rustxng=debug")),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
+
+    if let Some(install) = args.update {
+        return match rustxng::update::run(install).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     let settings_path = args.config.or_else(Settings::path_from_env);
     let mut settings = match Settings::load(settings_path.as_deref()) {
@@ -117,6 +150,15 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if args.mcp {
+        return match rustxng::mcp::serve_stdio(searcher).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     tracing::info!(engines = searcher.registry.len(), "{}", version_string());
 
     let state = AppState::new(searcher);

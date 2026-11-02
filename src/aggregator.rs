@@ -138,6 +138,8 @@ pub struct Searcher {
     pub settings: Arc<Settings>,
     pub registry: Arc<EngineRegistry>,
     pub network: Arc<Network>,
+    /// Checked, bounded page fetcher shared by optional raw-content requests.
+    pub page_reader: crate::mcp::page::PageReader,
     pub cache: Arc<Cache>,
     pub states: Arc<EngineStates>,
     pub metrics: Arc<Metrics>,
@@ -182,7 +184,10 @@ impl Searcher {
                 settings.cache.max_bytes.max(1024),
             ),
         };
+        let page_reader = crate::mcp::page::PageReader::new(&settings.outgoing, &[])?
+            .with_cache_ttl(Duration::from_secs(settings.cache.ttl.max(1)));
         Ok(Self {
+            page_reader,
             local_index: open_local_index(&settings),
             plugins: Arc::new(PluginManager::from_settings(&settings)),
             settings: Arc::new(settings),
@@ -278,11 +283,17 @@ impl Searcher {
                 return response;
             }
         }
-        let engines = self.select_engines(&request);
+        let mut engines = self.select_engines(&request);
         if engines.is_empty() {
             response.error = Some("no engine selected for this request".to_string());
             return response;
         }
+        // Some upstream online processors only apply when the query carries
+        // their own syntax (for example currency conversion or a translation
+        // language pair). Skip those engines before requests and failure
+        // accounting instead of reporting an unrelated general query as an
+        // engine failure.
+        engines.retain(|engine| engine.is_applicable(&request.query));
 
         // 全 engine の完了を待つ（join_all）。
         //
@@ -683,8 +694,7 @@ impl Searcher {
 
         let scoped = format!("site:{host} {text}");
         let mut second = request.clone();
-        second.query =
-            crate::query::Query::parse(&scoped, &self.registry, &request.disabled_engines);
+        second.query = request.query.with_query(&scoped);
         second.site_retry_done = true;
         second.timeout_limit = Some(
             request
@@ -855,31 +865,28 @@ impl Searcher {
                 .map(|result| self.page_text(&result.url)),
         )
         .await;
-        for (result, text) in results.iter_mut().take(count).zip(texts) {
-            result.raw_content = text;
+        for (result, page) in results.iter_mut().take(count).zip(texts) {
+            if let Some(page) = page {
+                result.raw_content = Some(page.text.to_string());
+                result.raw_content_truncated = Some(page.source_truncated);
+            }
         }
     }
 
-    /// The readable text of one page, `None` when it cannot be fetched.
-    async fn page_text(&self, url: &str) -> Option<String> {
-        // Result URLs come from third-party engines, so treat them as untrusted:
-        // an engine (or a poisoned result) must not make us fetch localhost or
-        // the cloud metadata endpoint on its behalf.
-        if !crate::web::image_proxy::is_public_url(url) {
-            tracing::debug!(url, "refusing to fetch a non-public page");
-            return None;
-        }
-        let request = crate::engine::EngineRequest::get(url)
-            .header("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8");
-        let response = self
-            .network
-            .fetch(request, Duration::from_secs(4), Some(&self.cache), None)
+    /// Optional page reads use the same DNS, redirect, body and concurrency
+    /// checks as MCP. Unchecked engine-response cache entries are not reused.
+    async fn page_text(&self, url: &str) -> Option<crate::mcp::page::PageContent> {
+        match self
+            .page_reader
+            .read(url, self.settings.search.raw_content_chars.max(1))
             .await
-            .ok()?;
-        let html = response.html().ok()?;
-        let text =
-            crate::content::main_text_limited(&html, self.settings.search.raw_content_chars.max(1));
-        if text.is_empty() { None } else { Some(text) }
+        {
+            Ok(page) => Some(page),
+            Err(error) => {
+                tracing::debug!(url, %error, "raw content unavailable");
+                None
+            }
+        }
     }
 
     /// Engine statistics for `/stats`.
@@ -1010,21 +1017,30 @@ mod orchestration_tests {
     use super::*;
     use crate::engine::{Engine, EngineError, EngineMeta, EngineRequest, EngineResponse};
 
+    type ApplicabilityPredicate = Box<dyn Fn(&Query) -> bool + Send + Sync>;
+
     /// An engine that never touches the network: it either fails while
     /// building the request or returns synthetic results.
     struct FakeEngine {
         meta: EngineMeta,
         results: usize,
         build_error: bool,
+        queries: std::sync::Mutex<Vec<Query>>,
+        applicable: Option<ApplicabilityPredicate>,
     }
 
     impl FakeEngine {
-        fn build(
+        fn build(name: &str, categories: &[&str], results: usize, build_error: bool) -> Arc<Self> {
+            Self::build_with_predicate(name, categories, results, build_error, None)
+        }
+
+        fn build_with_predicate(
             name: &str,
             categories: &[&str],
             results: usize,
             build_error: bool,
-        ) -> EngineHandle {
+            applicable: Option<ApplicabilityPredicate>,
+        ) -> Arc<Self> {
             let config = crate::settings::EngineConfig::new(name, "fake", name, categories);
             let mut meta = EngineMeta::from_config(
                 &config,
@@ -1039,6 +1055,8 @@ mod orchestration_tests {
                 meta,
                 results,
                 build_error,
+                queries: std::sync::Mutex::new(Vec::new()),
+                applicable,
             })
         }
     }
@@ -1047,7 +1065,14 @@ mod orchestration_tests {
         fn meta(&self) -> &EngineMeta {
             &self.meta
         }
+        fn is_applicable(&self, query: &Query) -> bool {
+            self.applicable
+                .as_ref()
+                .map(|predicate| predicate(query))
+                .unwrap_or(true)
+        }
         fn build_request(&self, query: &Query, _pageno: u32) -> Result<EngineRequest, EngineError> {
+            self.queries.lock().unwrap().push(query.clone());
             if self.build_error {
                 return Err(EngineError::Message("boom".into()));
             }
@@ -1080,6 +1105,7 @@ mod orchestration_tests {
         }
         let network = Network::from_settings(&settings).unwrap();
         Searcher {
+            page_reader: crate::mcp::page::PageReader::new(&settings.outgoing, &[]).unwrap(),
             local_index: None,
             plugins: Arc::new(PluginManager::new()),
             settings: Arc::new(settings),
@@ -1093,6 +1119,46 @@ mod orchestration_tests {
 
     fn query(text: &str, registry: &EngineRegistry) -> Query {
         Query::parse(text, registry, &[])
+    }
+
+    #[tokio::test]
+    async fn raw_content_refuses_private_result_urls() {
+        let searcher = searcher(vec![]);
+        let mut results = vec![SearchResult::new(
+            "http://127.0.0.1:9/private",
+            "poisoned result",
+        )];
+        searcher.attach_raw_content(&mut results).await;
+        assert!(results[0].raw_content.is_none());
+        assert!(results[0].raw_content_truncated.is_none());
+    }
+
+    #[tokio::test]
+    async fn site_retry_preserves_query_options_and_engine_selection() {
+        let selected = FakeEngine::build("selected", &["general"], 0, true);
+        let other = FakeEngine::build("other", &["general"], 0, true);
+        let mut searcher = searcher(vec![selected.clone(), other.clone()]);
+        Arc::make_mut(&mut searcher.settings)
+            .search
+            .site_scoped_retry = true;
+        let mut original = query("!selected :ja rust traits", &searcher.registry);
+        original.safesearch = 2;
+        original.time_range = Some(TimeRange::Week);
+        original.locale = "ja-JP".into();
+        let request = SearchRequest::new(original.clone());
+
+        searcher.site_scoped_retry(&request, Vec::new()).await;
+
+        let queries = selected.queries.lock().unwrap();
+        assert_eq!(queries.len(), 1);
+        let retried = &queries[0];
+        assert_eq!(retried.query_text(), "site:doc.rust-lang.org rust traits");
+        assert_eq!(retried.safesearch, original.safesearch);
+        assert_eq!(retried.time_range, original.time_range);
+        assert_eq!(retried.locale, original.locale);
+        assert_eq!(retried.languages, original.languages);
+        assert_eq!(retried.engine_refs, original.engine_refs);
+        assert!(other.queries.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1171,6 +1237,44 @@ mod orchestration_tests {
     }
 
     #[tokio::test]
+    async fn inapplicable_engines_are_skipped_without_failure() {
+        let searcher = searcher(vec![
+            FakeEngine::build_with_predicate(
+                "syntax engine",
+                &["general"],
+                1,
+                true,
+                Some(Box::new(|query| query.query_text().starts_with("run:"))),
+            ),
+            FakeEngine::build("web engine", &["general"], 0, true),
+        ]);
+        let request = SearchRequest::new(query("ordinary query", &searcher.registry));
+        let response = searcher.search(request).await;
+        assert!(!response.engines.contains(&"syntax engine".to_string()));
+        assert!(
+            response
+                .unresponsive_engines
+                .iter()
+                .all(|engine| engine.engine != "syntax engine")
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_syntax_keeps_the_engine_in_the_run_set() {
+        let searcher = searcher(vec![FakeEngine::build_with_predicate(
+            "syntax engine",
+            &["general"],
+            0,
+            true,
+            Some(Box::new(|query| query.query_text().starts_with("run:"))),
+        )]);
+        let request = SearchRequest::new(query("run: value", &searcher.registry));
+        let response = searcher.search(request).await;
+        assert_eq!(response.engines, vec!["syntax engine".to_string()]);
+        assert_eq!(response.unresponsive_engines.len(), 1);
+    }
+
+    #[tokio::test]
     async fn no_engine_selected_is_an_error() {
         let searcher = searcher(vec![FakeEngine::build(
             "image engine",
@@ -1187,11 +1291,11 @@ mod orchestration_tests {
     #[tokio::test]
     async fn external_bangs_redirect() {
         let searcher = searcher(vec![FakeEngine::build("web engine", &["general"], 1, true)]);
-        let request = SearchRequest::new(query("!!yt cats", &searcher.registry));
+        let request = SearchRequest::new(query("!!w cats", &searcher.registry));
         let response = searcher.search(request).await;
         assert_eq!(
             response.redirect_url.as_deref(),
-            Some("https://www.youtube.com/results?search_query=cats")
+            Some("https://en.wikipedia.org/wiki/Special:Search?search=cats")
         );
     }
 

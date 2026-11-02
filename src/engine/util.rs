@@ -334,6 +334,9 @@ pub fn locale_language(locale: &str) -> String {
     locale
         .split(['-', '_'])
         .next()
+        .filter(|language| {
+            !language.is_empty() && language.bytes().all(|byte| byte.is_ascii_alphabetic())
+        })
         .unwrap_or("all")
         .to_lowercase()
 }
@@ -348,6 +351,41 @@ pub fn locale_region(locale: &str) -> String {
         Some(region) => region.to_lowercase(),
         None => "all".to_string(),
     }
+}
+
+/// Parse the language pair and payload used by SearXNG's online-dictionary
+/// processors (for example `en-de hello` or `english-german hallo`).
+/// Unknown language identifiers and queries without a payload are rejected.
+pub fn online_dictionary_direction(text: &str) -> Option<(String, String, String)> {
+    static PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)^.*?([a-z]+)-([a-z]+) (.+)$").expect("dictionary pattern")
+    });
+    let captures = PATTERN.captures(text)?;
+    let payload = captures[3].trim();
+    if payload.is_empty() {
+        return None;
+    }
+    let from = resolve_locale_id(&captures[1])?;
+    let to = resolve_locale_id(&captures[2])?;
+    Some((from, to, payload.to_string()))
+}
+
+fn resolve_locale_id(value: &str) -> Option<String> {
+    crate::locales::LOCALES
+        .iter()
+        .find(|locale| {
+            if value.len() == 2 {
+                locale
+                    .id
+                    .get(..2)
+                    .is_some_and(|id| id.eq_ignore_ascii_case(value))
+            } else {
+                locale.english.eq_ignore_ascii_case(value)
+                    || locale.native.eq_ignore_ascii_case(value)
+            }
+        })
+        .and_then(|locale| locale.id.get(..2))
+        .map(str::to_lowercase)
 }
 
 /// One entry of an RSS 2.0 feed (Google News, Bing News, ...).
@@ -521,11 +559,53 @@ mod tests {
     }
 
     #[test]
+    fn locale_language_rejects_url_syntax() {
+        for (locale, expected) in [
+            ("ja-JP", "ja"),
+            ("EN_us", "en"),
+            ("simple", "simple"),
+            ("", "all"),
+            ("all", "all"),
+            ("auto", "all"),
+            ("en/", "all"),
+            ("en\\", "all"),
+            ("en.", "all"),
+            ("en@", "all"),
+            ("en?", "all"),
+            ("en#", "all"),
+            ("en:", "all"),
+            ("en%2f", "all"),
+            ("-US", "all"),
+        ] {
+            assert_eq!(locale_language(locale), expected, "{locale:?}");
+        }
+    }
+
+    #[test]
     fn html_extraction_helpers_work() {
         let html = parse_html("<ul><li><a href=\"/x\">Title</a><p>Body</p></li></ul>");
         let items = select_elements(&html, "li").unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(text_of(items[0], "a").as_deref(), Some("Title"));
         assert_eq!(attr_of(items[0], "a", "href").as_deref(), Some("/x"));
+    }
+
+    #[test]
+    fn online_dictionary_direction_parses_language_pairs() {
+        assert_eq!(
+            online_dictionary_direction("en-de hello"),
+            Some(("en".to_string(), "de".to_string(), "hello".to_string()))
+        );
+        assert_eq!(
+            online_dictionary_direction("english-german hallo"),
+            Some(("en".to_string(), "de".to_string(), "hallo".to_string()))
+        );
+        assert_eq!(
+            online_dictionary_direction("ja-en 東京 tower"),
+            Some(("ja".to_string(), "en".to_string(), "東京 tower".to_string()))
+        );
+        assert_eq!(online_dictionary_direction("xx-yy hello"), None);
+        assert_eq!(online_dictionary_direction("hello world"), None);
+        assert_eq!(online_dictionary_direction("en-de"), None);
     }
 }

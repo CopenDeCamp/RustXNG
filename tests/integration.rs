@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{Request, StatusCode, Uri, header};
 use axum::routing::get;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
@@ -489,6 +489,161 @@ async fn the_rate_limiter_answers_429_after_the_limit() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// The JSON payload the fake YaCy engine answers with.
+const YACY_RESPONSE: &str = r#"{
+  "channels": [{
+    "items": [
+      {"link": "https://example.com/yacy", "title": "YaCy Result", "description": "A result."}
+    ]
+  }]
+}"#;
+
+/// The JSON payload the fake declarative JSON engine answers with.
+const JSON_ENGINE_RESPONSE: &str = r#"{
+  "results": [
+    {"url": "https://example.com/json", "title": "JSON Result", "content": "A result."}
+  ]
+}"#;
+
+/// Start fake engines that record every request URI, and return the base
+/// URL plus the recording.
+async fn start_recording_engines() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_yacy = seen.clone();
+    let seen_json = seen.clone();
+    let app = Router::new()
+        .route(
+            "/yacysearch.json",
+            get(move |uri: Uri| {
+                let seen = seen_yacy.clone();
+                async move {
+                    seen.lock().unwrap().push(uri.to_string());
+                    ([(header::CONTENT_TYPE, "application/json")], YACY_RESPONSE)
+                }
+            }),
+        )
+        .route(
+            "/jsonsearch",
+            get(move |uri: Uri| {
+                let seen = seen_json.clone();
+                async move {
+                    seen.lock().unwrap().push(uri.to_string());
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        JSON_ENGINE_RESPONSE,
+                    )
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{address}"), seen)
+}
+
+/// Settings with two language-aware fake engines: YaCy reads
+/// `Query::engine_language`, the declarative JSON engine reads
+/// `Query::locale` through its `{lang}` URL placeholder.
+fn language_settings(base_url: &str) -> Settings {
+    let mut settings = Settings::defaults();
+    let mut yacy = EngineConfig::new("yacy", "yacy", "ya", &["general"]);
+    yacy.base_url = Some(base_url.to_string());
+    yacy.timeout = Some(1.0);
+    let mut json = EngineConfig::new("fakejson", "json_engine", "fj", &["general"]);
+    json.search_url = Some(format!("{base_url}/jsonsearch?q={{query}}&lang={{lang}}"));
+    json.timeout = Some(1.0);
+    for (key, value) in [
+        ("results_query", "results"),
+        ("url_query", "url"),
+        ("title_query", "title"),
+        ("content_query", "content"),
+    ] {
+        json.extra
+            .insert(key.to_string(), toml::Value::String(value.to_string()));
+    }
+    settings.engines = vec![yacy, json];
+    settings.search.autocomplete = "none".to_string();
+    settings.search.timeout_limit = 1.0;
+    settings.server.secret_key = "test".to_string();
+    settings
+}
+
+#[tokio::test]
+async fn language_parameter_reaches_the_engines() {
+    let (base_url, seen) = start_recording_engines().await;
+    let app = app(language_settings(&base_url));
+
+    // The shape Firecrawl sends: q + language + format=json.
+    let (status, body, _) = get_uri(&app, "/search?q=rust&format=json&language=fr").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["results"].as_array().unwrap().len(), 2);
+    {
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|uri| uri.starts_with("/yacysearch.json") && uri.contains("lr=lang_fr")),
+            "yacy saw: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|uri| uri.starts_with("/jsonsearch") && uri.contains("lang=fr")),
+            "json engine saw: {seen:?}"
+        );
+    }
+
+    // A `:lang` bang wins over the parameter, like upstream.
+    seen.lock().unwrap().clear();
+    let (status, _, _) = get_uri(&app, "/search?q=%3Aja+rust&format=json&language=fr").await;
+    assert_eq!(status, StatusCode::OK);
+    {
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|uri| uri.starts_with("/yacysearch.json") && uri.contains("lr=lang_ja")),
+            "yacy saw: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|uri| uri.starts_with("/jsonsearch") && uri.contains("lang=ja")),
+            "json engine saw: {seen:?}"
+        );
+    }
+
+    // `auto` detects the query language and also reaches engines that use
+    // the request locale directly, such as the JSON engine's `{lang}`.
+    seen.lock().unwrap().clear();
+    let (status, _, _) = get_uri(
+        &app,
+        "/search?q=%E6%97%A5%E6%9C%AC%E8%AA%9E&format=json&language=auto",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    {
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|uri| uri.starts_with("/yacysearch.json") && uri.contains("lr=lang_ja")),
+            "yacy saw: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|uri| uri.starts_with("/jsonsearch") && uri.contains("lang=ja")),
+            "json engine saw: {seen:?}"
+        );
+    }
+
+    // An invalid language is a client error, like upstream.
+    let (status, _, _) = get_uri(&app, "/search?q=rust&format=json&language=not-a-language").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body, _) = get_uri(&app, "/search?q=rust&format=json&language=xyz").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["error"], "invalid language code: xyz");
+}
+
 #[tokio::test]
 async fn the_search_form_offers_a_time_range() {
     let base_url = start_fake_engine().await;
@@ -498,4 +653,209 @@ async fn the_search_form_offers_a_time_range() {
     assert!(body.contains("name=\"time_range\""));
     assert!(body.contains("value=\"week\" selected"));
     assert!(body.contains("Past week"));
+}
+
+/// Helper: create settings with no engines and resting enabled after 1 empty result.
+fn resting_test_settings() -> Settings {
+    let mut settings = Settings::defaults();
+    settings.engines.clear();
+    settings.search.empty_result_limit = 1;
+    settings.search.empty_result_cooldown = 300;
+    settings.server.secret_key = "test".to_string();
+    settings
+}
+
+#[tokio::test]
+async fn stats_endpoint_shows_resting_engines() {
+    let settings = resting_test_settings();
+    let searcher = Searcher::new(settings).expect("searcher");
+
+    // Manually trigger resting by recording an empty success
+    searcher.states.record_success(
+        "testeng",
+        0,
+        std::time::Duration::from_millis(50),
+        &searcher.settings.search,
+    );
+
+    let app = router(AppState::new(searcher));
+
+    // /stats HTML should show the Resting column
+    let (status, body, _) = get_uri(&app, "/stats").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("<th>Resting</th>"),
+        "stats should have Resting column"
+    );
+    assert!(
+        body.contains("empty results"),
+        "resting engine should show 'empty results'"
+    );
+
+    // /stats/errors JSON should include resting fields
+    let (status, body, _) = get_uri(&app, "/stats/errors").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let engines = json.as_array().unwrap();
+    let eng = engines.iter().find(|e| e["engine"] == "testeng").unwrap();
+    assert!(
+        eng["resting"].as_bool().unwrap(),
+        "engine should be resting"
+    );
+    assert!(
+        eng["resting_for"].as_f64().unwrap() > 0.0,
+        "resting_for should be positive"
+    );
+    // suspended should be false (resting is distinct from failure suspension)
+    assert!(
+        !eng["suspended"].as_bool().unwrap(),
+        "engine should not be suspended"
+    );
+}
+
+#[tokio::test]
+async fn metrics_endpoint_exposes_resting_gauges() {
+    let settings = resting_test_settings();
+    let searcher = Searcher::new(settings).expect("searcher");
+
+    // Trigger resting
+    searcher.states.record_success(
+        "testeng",
+        0,
+        std::time::Duration::from_millis(50),
+        &searcher.settings.search,
+    );
+
+    let app = router(AppState::new(searcher));
+
+    let (status, body, _) = get_uri(&app, "/metrics").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Check HELP lines exist
+    assert!(
+        body.contains("# HELP searxng_engines_resting"),
+        "metrics should include resting HELP"
+    );
+    assert!(
+        body.contains("# HELP searxng_engines_resting_seconds"),
+        "metrics should include resting_seconds HELP"
+    );
+
+    // Check gauge values for testeng
+    let resting_line = body
+        .lines()
+        .find(|line| line.starts_with("searxng_engines_resting{engine=\"testeng\"}"))
+        .expect("resting gauge should be exported");
+    assert!(
+        resting_line.ends_with(" 1"),
+        "testeng should be resting (value=1)"
+    );
+
+    let seconds_line = body
+        .lines()
+        .find(|line| line.starts_with("searxng_engines_resting_seconds{engine=\"testeng\"}"))
+        .expect("resting_seconds gauge should be exported");
+    let seconds_value: f64 = seconds_line
+        .rsplit(' ')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .expect("seconds value should be a number");
+    assert!(seconds_value > 0.0, "resting_seconds should be positive");
+}
+
+#[tokio::test]
+async fn stats_shows_recovery_from_resting() {
+    let settings = resting_test_settings();
+    let searcher = Searcher::new(settings).expect("searcher");
+    let states = searcher.states.clone();
+
+    // Trigger resting
+    states.record_success(
+        "testeng",
+        0,
+        std::time::Duration::from_millis(50),
+        &searcher.settings.search,
+    );
+
+    let app = router(AppState::new(searcher));
+
+    // Verify resting via /stats HTML
+    let (status, body, _) = get_uri(&app, "/stats").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("empty results"),
+        "engine should be resting initially"
+    );
+
+    // Verify resting via /stats/errors JSON
+    let (_, body, _) = get_uri(&app, "/stats/errors").await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let eng = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["engine"] == "testeng")
+        .unwrap();
+    assert!(eng["resting"].as_bool().unwrap());
+
+    // Verify resting via /metrics
+    let (_, body, _) = get_uri(&app, "/metrics").await;
+    let resting_line = body
+        .lines()
+        .find(|line| line.starts_with("searxng_engines_resting{engine=\"testeng\"}"))
+        .unwrap();
+    assert!(resting_line.ends_with(" 1"));
+
+    // Recover by returning actual results (using the same Arc<EngineStates>)
+    states.record_success(
+        "testeng",
+        5,
+        std::time::Duration::from_millis(100),
+        &rustxng::settings::Search {
+            empty_result_limit: 1,
+            empty_result_cooldown: 300,
+            ..Default::default()
+        },
+    );
+
+    // /stats HTML should no longer show "empty results"
+    let (_, body, _) = get_uri(&app, "/stats").await;
+    assert!(
+        !body.contains("empty results"),
+        "engine should not be resting after recovery"
+    );
+
+    // /stats/errors JSON should show resting=false, resting_for=0
+    let (_, body, _) = get_uri(&app, "/stats/errors").await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let eng = json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["engine"] == "testeng")
+        .unwrap();
+    assert!(
+        !eng["resting"].as_bool().unwrap(),
+        "engine should not be resting after recovery"
+    );
+    assert_eq!(eng["resting_for"].as_f64().unwrap(), 0.0);
+
+    // /metrics should show resting=0, resting_seconds=0
+    let (_, body, _) = get_uri(&app, "/metrics").await;
+    let resting_line = body
+        .lines()
+        .find(|line| line.starts_with("searxng_engines_resting{engine=\"testeng\"}"))
+        .unwrap();
+    assert!(
+        resting_line.ends_with(" 0"),
+        "resting gauge should be 0 after recovery"
+    );
+    let seconds_line = body
+        .lines()
+        .find(|line| line.starts_with("searxng_engines_resting_seconds{engine=\"testeng\"}"))
+        .unwrap();
+    assert!(
+        seconds_line.ends_with(" 0.000"),
+        "resting_seconds should be 0 after recovery"
+    );
 }

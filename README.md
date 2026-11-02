@@ -65,9 +65,31 @@ Use these existing parameters to narrow the response:
 
 Page text is optional. With default settings it is fetched for up to five results,
 with a limit of 8,000 characters per page; individual fetches can fail.
-Character limits are not token limits. Strict token budgets and server-side field selection are planned.
+Character limits are not token limits. The MCP tools below add serialized character/byte budgets. Token-specific budgets and
+field selection on the HTTP API are planned.
 
 The browser UI is at <http://127.0.0.1:29483/>. JSON, CSV, RSS, and HTML outputs are available.
+
+### MCP server
+
+Run `rustxng mcp` to serve the read-only `search` and `read_page` tools over
+stdio. Search returns ranked snippets and source metadata; page text is fetched
+only when `read_page` is called with a URL returned by search in that session.
+Search defaults to five results and limits each snippet to 500 characters.
+Its serialized structured response is bounded to 12,000 Unicode characters
+and 24,000 UTF-8 bytes by default; callers can choose smaller or larger limits
+within the advertised bounds. The server shortens snippets first, then omits
+trailing results while preserving complete URLs and metadata for the returned results. `truncated`,
+`source_truncated`, and `next_offset` report whether to continue. `read_page`
+uses Unicode character offsets and reports the same truncation state. Supplying
+a `query` to `read_page` also returns up to three matching passages.
+
+Page reads require direct connections so DNS answers and redirects can be
+checked against public addresses. They fail closed when configured or
+environment outgoing proxies are present. Search continues to use the normal
+outgoing proxy settings. Character and byte limits count the serialized structured JSON payload only,
+excluding the JSON-RPC envelope, SDK text rendering, and caller prompts;
+they do not promise a tokenizer-specific token count.
 
 ## Install
 
@@ -75,7 +97,8 @@ The browser UI is at <http://127.0.0.1:29483/>. JSON, CSV, RSS, and HTML outputs
 
 Choose a binary and its `.sha256` sidecar from [Releases](https://github.com/sahenjp/RustXNG/releases).
 The published v0.26.0 release includes Linux x86_64 (GNU and musl), macOS arm64/x86_64,
-and Windows x86_64 binaries. The [agent setup guide](docs/AGENT-SETUP.md) explains selection and verification.
+and Windows x86_64 binaries. Releases after v0.26.0 add Linux ARM64 (`aarch64-unknown-linux-gnu`, glibc 2.39+).
+The [agent setup guide](docs/AGENT-SETUP.md) explains selection and verification.
 Prebuilt binaries do not require a Rust toolchain.
 
 Example for Linux x86_64, using the GitHub CLI and a user-owned install directory:
@@ -187,8 +210,11 @@ with their own datasets and conditions.
 
 The engine interface supports authenticated HTTP APIs through request headers, form data, and JSON.
 Optional providers require their own credentials and may charge for usage.
-Server-side field selection, relevant passages, and strict token budgets remain future work;
-use `max_results`, domain filters, and client-side projection today.
+For the HTTP API, use `max_results`, domain filters, and client-side projection.
+MCP also offers related passages and serialized character/byte limits. Strict
+tokenizer-specific budgets remain future work.
+
+Engines that keep returning empty results are automatically rested. Configure with `search.empty_result_limit` (default 8, 0 disables) and `search.empty_result_cooldown` (default 300 seconds). Monitor via `/stats` (HTML Resting column), `/stats/errors` (JSON `resting` / `resting_for` fields), or `/metrics` (`searxng_engines_resting` and `searxng_engines_resting_seconds` gauges)
 
 ## Documentation
 
@@ -226,3 +252,27 @@ cargo test --all-targets
 
 [AGPL-3.0-or-later](LICENSE). RustXNG is based on [SearXNG](https://github.com/searxng/searxng);
 attribution is in [NOTICE](NOTICE). See the license for source-distribution obligations when operating modified versions.
+
+## Updating and proxy environments
+
+Run `rustxng --check-update` to check the latest stable official GitHub release,
+or `rustxng --update` to download the matching build target, verify its SHA-256
+sidecar, and replace the executable. Settings are preserved; restart your service
+after updating. The executable directory must be writable. Update container images
+through your container runtime, and use the original package manager for managed
+installations. Rebuild custom or unsupported targets from source.
+Update TLS verification is always enabled, independent of search settings.
+
+Both search and updates trust OS CA certificates. Use `SSL_CERT_FILE` for a custom
+PEM bundle, or set `outgoing.ca_bundle` for additional search CA certificates.
+`outgoing.ca_bundle` only applies to the shared search HTTP client, not standalone
+embedding, LLM or crawler clients. Keep `outgoing.verify = true`.
+
+For congested outbound proxies, set `search.strategy = "staged"`,
+`search.staged_tier = 8`, `search.staged_min_results = 10`,
+`search.timeout_limit = 15.0`, and `outgoing.request_timeout = 10.0` in your
+user settings. These opt-in settings stagger engine requests and extend deadlines.
+
+Google search engines, autocomplete, external bangs, YouTube, Google translation
+integrations, Material Icons, and Google-backed search front ends have been removed.
+Remove their entries from older custom settings before starting the server.

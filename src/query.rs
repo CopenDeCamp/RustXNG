@@ -397,10 +397,18 @@ impl Query {
     /// The language sent to the engines: the first requested language, or the
     /// UI locale when nothing was requested.
     pub fn engine_language(&self) -> String {
-        if let Some(language) = self.languages.first() {
+        let automatic = self
+            .languages
+            .first()
+            .is_some_and(|language| language == "auto");
+        if let Some(language) = self
+            .languages
+            .first()
+            .filter(|language| language.as_str() != "auto")
+        {
             return language.clone();
         }
-        if !self.locale.is_empty() {
+        if !automatic && !self.locale.is_empty() {
             return self.locale.clone();
         }
         // Neither the UI nor the request chose a language: follow the query.
@@ -413,6 +421,40 @@ impl Query {
             "ja".to_string()
         } else {
             "en".to_string()
+        }
+    }
+
+    /// Apply the `language` request parameter, following upstream's
+    /// `parse_lang` (`searx/webadapter.py`): a `:lang` bang in the query
+    /// wins over the parameter, and a value that is neither a language
+    /// code nor `auto` is an error (upstream answers 400).
+    pub fn apply_language_param(&mut self, value: &str) -> Result<(), String> {
+        let value = value.trim();
+        if value.is_empty() || !self.languages.is_empty() {
+            return Ok(());
+        }
+        match language_code_value(value) {
+            Some(language) => {
+                self.languages.push(language);
+                Ok(())
+            }
+            None => Err(format!("invalid language code: {value}")),
+        }
+    }
+
+    /// Fill the language from the preferences when neither a bang nor the
+    /// `language` parameter chose one (upstream's last resort in
+    /// `parse_lang`). Invalid values and `auto` are ignored: `auto` is
+    /// the seeded default, and honouring it here would suppress the
+    /// locale / query-language fallback in [`Query::engine_language`].
+    pub fn apply_language_preference(&mut self, value: &str) {
+        if !self.languages.is_empty() {
+            return;
+        }
+        if let Some(language) = language_code_value(value) {
+            if language != "auto" {
+                self.languages.push(language);
+            }
         }
     }
 
@@ -431,6 +473,23 @@ impl Query {
         }
         vec![categories::GENERAL.to_string()]
     }
+}
+
+/// A request language value normalised like a `:lang` code, or `None`
+/// when the value is not a language code (and not `auto`).
+fn language_code_value(value: &str) -> Option<String> {
+    let lowered = value.trim().to_lowercase().replace('_', "-");
+    if lowered == "auto" {
+        return Some(lowered);
+    }
+    let normalized = normalise_locale(&lowered);
+    if locales::LOCALES
+        .iter()
+        .any(|locale| locale.id.eq_ignore_ascii_case(&normalized))
+    {
+        return Some(normalized);
+    }
+    None
 }
 
 fn normalise_locale(value: &str) -> String {
@@ -506,12 +565,12 @@ mod tests {
 
     #[test]
     fn disabled_engines_are_skipped_in_category_bangs() {
-        let disabled = vec!["google images".to_string()];
+        let disabled = vec!["bing images".to_string()];
         let query = Query::parse("!images cats", &registry(), &disabled);
         assert!(
             !query
                 .engine_ref_names()
-                .contains(&"google images".to_string())
+                .contains(&"bing images".to_string())
         );
     }
 
@@ -526,6 +585,73 @@ mod tests {
         assert!(query.languages.contains(&"ja-JP".to_string()));
         let query = Query::parse(":en-us test", &registry(), &[]);
         assert_eq!(query.languages, vec!["en-US".to_string()]);
+    }
+
+    #[test]
+    fn language_parameter_sets_the_engine_language() {
+        let mut query = Query::parse("rust async", &registry(), &[]);
+        query.apply_language_param("fr").expect("valid code");
+        assert_eq!(query.languages, vec!["fr".to_string()]);
+        assert_eq!(query.engine_language(), "fr");
+    }
+
+    #[test]
+    fn language_parameter_is_normalised() {
+        let mut query = Query::parse("rust", &registry(), &[]);
+        query.apply_language_param("en-us").expect("valid code");
+        assert_eq!(query.languages, vec!["en-US".to_string()]);
+        let mut query = Query::parse("rust", &registry(), &[]);
+        query.apply_language_param(" auto ").expect("auto is valid");
+        assert_eq!(query.languages, vec!["auto".to_string()]);
+    }
+
+    #[test]
+    fn auto_language_keeps_query_detection_and_overrides_preferences() {
+        let mut query = Query::parse("日本語のエラー", &registry(), &[]);
+        query.locale = "en".into();
+        query.apply_language_param("auto").unwrap();
+        query.apply_language_preference("fr");
+        assert_eq!(query.engine_language(), "ja");
+        let mut query = Query::parse(":auto 日本語", &registry(), &[]);
+        query.locale = "en".into();
+        assert_eq!(query.engine_language(), "ja");
+    }
+
+    #[test]
+    fn language_bang_wins_over_the_parameter() {
+        let mut query = Query::parse(":ja 猫", &registry(), &[]);
+        query
+            .apply_language_param("fr")
+            .expect("bang wins, no error");
+        assert_eq!(query.languages, vec!["ja".to_string()]);
+    }
+
+    #[test]
+    fn invalid_language_parameter_is_rejected() {
+        let mut query = Query::parse("rust", &registry(), &[]);
+        assert!(query.apply_language_param("not-a-language").is_err());
+        assert!(query.apply_language_param("xyz").is_err());
+        assert!(query.apply_language_param("zz-ZZ").is_err());
+        assert!(query.languages.is_empty());
+        // An empty parameter counts as absent.
+        query.apply_language_param("").expect("empty is ignored");
+        assert!(query.languages.is_empty());
+    }
+
+    #[test]
+    fn language_preference_is_the_last_resort() {
+        let mut query = Query::parse("rust", &registry(), &[]);
+        query.apply_language_preference("ja");
+        assert_eq!(query.languages, vec!["ja".to_string()]);
+        // A bang already chose: the preference changes nothing.
+        let mut query = Query::parse(":fr chat", &registry(), &[]);
+        query.apply_language_preference("ja");
+        assert_eq!(query.languages, vec!["fr".to_string()]);
+        // `auto` and junk never enter the language list.
+        let mut query = Query::parse("rust", &registry(), &[]);
+        query.apply_language_preference("auto");
+        query.apply_language_preference("not-a-language");
+        assert!(query.languages.is_empty());
     }
 
     #[test]
@@ -553,14 +679,14 @@ mod tests {
 
     #[test]
     fn external_bang_is_recognised() {
-        let query = Query::parse("!!yt cats", &registry(), &[]);
-        assert_eq!(query.external_bang.as_deref(), Some("yt"));
+        let query = Query::parse("!!w cats", &registry(), &[]);
+        assert_eq!(query.external_bang.as_deref(), Some("w"));
     }
 
     #[test]
     fn autocomplete_lists_bangs_and_languages() {
-        let query = Query::parse("!goo", &registry(), &[]);
-        assert!(query.autocomplete_list.contains(&"!google".to_string()));
+        let query = Query::parse("!duck", &registry(), &[]);
+        assert!(query.autocomplete_list.contains(&"!duckduckgo".to_string()));
         // ":jap" is a valid language code, so it is parsed instead of being
         // autocompleted; ":engl" is not.
         let query = Query::parse(":engl", &registry(), &[]);

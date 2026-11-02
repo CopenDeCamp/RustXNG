@@ -161,6 +161,41 @@ async fn run_search(
         .filter(|value| !value.is_empty())
         .or_else(|| Some(preferences.locale.clone()).filter(|value| !value.is_empty()))
         .unwrap_or_default();
+    // Upstream `parse_lang`: `:lang` bang > `language` parameter > language
+    // preference. Until now the parameter was only echoed back into the
+    // paging links and never reached the engines.
+    if let Some(language) = params.language.as_deref() {
+        if let Err(message) = query.apply_language_param(language) {
+            if format == "json" {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({"error": message})),
+                )
+                    .into_response();
+            }
+            return error_page(&state, StatusCode::BAD_REQUEST, &message);
+        }
+    }
+    let language_requested = !query.languages.is_empty();
+    query.apply_language_preference(&preferences.language);
+    // Most engines take their language/region from `query.locale`, so an
+    // explicitly requested language doubles as the locale — unless the
+    // caller picked a locale as well.
+    if language_requested
+        && params
+            .locale
+            .as_deref()
+            .map(|value| value.is_empty())
+            .unwrap_or(true)
+    {
+        if let Some(language) = query.languages.first() {
+            query.locale = if language == "auto" {
+                query.engine_language()
+            } else {
+                language.clone()
+            };
+        }
+    }
     query.pageno = params.pageno.unwrap_or(1).max(1);
     query.time_range = params.time_range.as_deref().and_then(TimeRange::parse);
     query.safesearch = params.safesearch.unwrap_or(preferences.safesearch).min(2);
@@ -190,11 +225,7 @@ async fn run_search(
         .unwrap_or_else(|| preferences.enabled_plugins.clone());
     let disabled_plugins = split_param(params.disabled_plugins.as_deref())
         .unwrap_or_else(|| preferences.disabled_plugins.clone());
-    let language = if preferences.language.is_empty() {
-        query.engine_language()
-    } else {
-        preferences.language.clone()
-    };
+    let language = query.engine_language();
 
     let user = user_info(&headers);
     match state.limiter.check(peer.0, &headers, &format) {
@@ -611,7 +642,6 @@ pub async fn preferences_get(State(state): State<AppState>, headers: HeaderMap) 
         vec![
             ("none".to_string(), "Off".to_string()),
             ("duckduckgo".to_string(), "DuckDuckGo".to_string()),
-            ("google".to_string(), "Google".to_string()),
             ("wikipedia".to_string(), "Wikipedia".to_string()),
             ("mwmbl".to_string(), "Mwmbl".to_string()),
         ],
@@ -845,6 +875,8 @@ fn prometheus_metrics(state: &AppState) -> String {
     out.push_str("# HELP searxng_engines_response_time_total_seconds Time spent waiting for an engine\n# TYPE searxng_engines_response_time_total_seconds counter\n");
     out.push_str("# HELP searxng_engines_reliability_total Share of successful requests\n# TYPE searxng_engines_reliability_total gauge\n");
     out.push_str("# HELP searxng_engines_suspended Whether the engine is currently suspended\n# TYPE searxng_engines_suspended gauge\n");
+    out.push_str("# HELP searxng_engines_resting Whether the engine is resting due to repeated empty results\n# TYPE searxng_engines_resting gauge\n");
+    out.push_str("# HELP searxng_engines_resting_seconds Remaining rest time in seconds\n# TYPE searxng_engines_resting_seconds gauge\n");
     for engine in state.searcher.engine_snapshots() {
         let label = engine.engine.replace('"', "");
         let reliability = if engine.stats.requests == 0 {
@@ -874,6 +906,14 @@ fn prometheus_metrics(state: &AppState) -> String {
         out.push_str(&format!(
             "searxng_engines_suspended{{engine=\"{label}\"}} {}\n",
             if engine.suspended { 1 } else { 0 }
+        ));
+        out.push_str(&format!(
+            "searxng_engines_resting{{engine=\"{label}\"}} {}\n",
+            if engine.resting { 1 } else { 0 }
+        ));
+        out.push_str(&format!(
+            "searxng_engines_resting_seconds{{engine=\"{label}\"}} {:.3}\n",
+            engine.resting_for
         ));
     }
     out.push_str("# EOF\n");
