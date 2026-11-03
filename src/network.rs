@@ -93,9 +93,10 @@ pub struct Network {
 fn build_client(
     outgoing: &crate::settings::Outgoing,
     extra_proxy: Option<reqwest::Proxy>,
+    redirects: reqwest::redirect::Policy,
 ) -> Result<reqwest::Client, NetworkError> {
     let mut builder = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(outgoing.max_redirects))
+        .redirect(redirects)
         .timeout(Duration::from_secs_f64(
             outgoing.max_request_timeout.max(1.0),
         ))
@@ -138,11 +139,13 @@ fn build_client(
 }
 
 /// A normal (non-public-only) client for a trusted API endpoint.
-/// It honours the outgoing proxy, TLS and CA settings.
+/// It honours the outgoing proxy, TLS and CA settings, but never follows
+/// redirects: the configured endpoint is fixed and a redirect must not make
+/// the local process contact another destination.
 pub(crate) fn api_client(
     outgoing: &crate::settings::Outgoing,
 ) -> Result<reqwest::Client, NetworkError> {
-    build_client(outgoing, None)
+    build_client(outgoing, None, reqwest::redirect::Policy::none())
 }
 
 impl Network {
@@ -154,7 +157,11 @@ impl Network {
 
     pub fn from_settings(settings: &Settings) -> Result<Self, NetworkError> {
         let outgoing = &settings.outgoing;
-        let client = build_client(outgoing, None)?;
+        let client = build_client(
+            outgoing,
+            None,
+            reqwest::redirect::Policy::limited(outgoing.max_redirects),
+        )?;
         let (media_client, media_proxy_blocked) =
             crate::fetch::public_client(outgoing, &[]).map_err(NetworkError::Build)?;
         Ok(Self {
@@ -185,7 +192,11 @@ impl Network {
         }
         let configured =
             reqwest::Proxy::all(proxy).map_err(|error| NetworkError::Build(error.to_string()))?;
-        let client = build_client(&self.outgoing, Some(configured))?;
+        let client = build_client(
+            &self.outgoing,
+            Some(configured),
+            reqwest::redirect::Policy::limited(self.outgoing.max_redirects),
+        )?;
         if let Ok(mut cache) = self.proxied.lock() {
             cache.insert(proxy.to_string(), client.clone());
         }
@@ -651,9 +662,9 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), b"not a certificate").unwrap();
         outgoing.ca_bundle = Some(file.path().to_string_lossy().into_owned());
-        assert!(build_client(&outgoing, None).is_err());
+        assert!(build_client(&outgoing, None, reqwest::redirect::Policy::none()).is_err());
         outgoing.ca_bundle = Some("/nonexistent/rustxng-ca.pem".into());
-        assert!(build_client(&outgoing, None).is_err());
+        assert!(build_client(&outgoing, None, reqwest::redirect::Policy::none()).is_err());
         assert!(outgoing.verify);
     }
 

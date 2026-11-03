@@ -946,9 +946,12 @@ impl Settings {
                 "search.safe_search must be 0, 1 or 2".into(),
             ));
         }
-        if self.fetch.timeout <= 0.0 {
+        if !self.fetch.timeout.is_finite()
+            || self.fetch.timeout <= 0.0
+            || std::time::Duration::try_from_secs_f64(self.fetch.timeout).is_err()
+        {
             return Err(SettingsError::Validation(
-                "fetch.timeout must be greater than 0".into(),
+                "fetch.timeout must be a finite positive duration".into(),
             ));
         }
         if self.outgoing.request_timeout <= 0.0 || self.outgoing.max_request_timeout <= 0.0 {
@@ -1577,6 +1580,24 @@ engines:
         assert_eq!(settings.fetch.provider, FetchProvider::DeepSeek);
         assert_eq!(settings.fetch.timeout, 12.0);
         assert_eq!(settings.fetch.deepseek.api_key, "KEY");
+    }
+
+    #[test]
+    fn fetch_timeout_must_be_finite_and_representable() {
+        for (name, value) in [
+            ("zero", "0.0"),
+            ("negative", "-1.0"),
+            ("infinity", "inf"),
+            ("negative infinity", "-inf"),
+            ("not a number", "nan"),
+            ("out of range", "1e300"),
+        ] {
+            let settings = merged_toml(&format!("[fetch]\ntimeout = {value}\n"));
+            assert!(
+                settings.validate().is_err(),
+                "fetch.timeout = {value} ({name}) must be rejected"
+            );
+        }
     }
 
     #[test]

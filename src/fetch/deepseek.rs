@@ -52,13 +52,22 @@ impl DeepSeekSource {
         } else {
             base_url.trim_end_matches('/').to_string()
         };
+        let timeout = Self::validated_timeout(timeout)?;
         let client = crate::network::api_client(outgoing).map_err(|error| error.to_string())?;
         Ok(Self {
             client,
             base_url,
             api_key,
-            timeout: Duration::from_secs_f64(timeout.max(1.0)),
+            timeout,
         })
+    }
+
+    fn validated_timeout(timeout: f64) -> Result<Duration, String> {
+        if !timeout.is_finite() || timeout <= 0.0 {
+            return Err("fetch.timeout must be a finite positive duration".into());
+        }
+        Duration::try_from_secs_f64(timeout.max(1.0))
+            .map_err(|_| "fetch.timeout is outside the representable duration range".into())
     }
 
     fn endpoint(&self) -> String {
@@ -140,23 +149,20 @@ impl DeepSeekSource {
         })
         .await
         .map_err(|_| (true, "DeepSeek Fetch response timed out".to_string()))??;
+        if !status.is_success() {
+            let retryable = matches!(status_code, 408 | 429 | 500..=599);
+            let message = Self::error_message(&bytes);
+            return Err((
+                retryable,
+                format!("DeepSeek Fetch HTTP {status_code}: {message}"),
+            ));
+        }
         let payload: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
             (
                 false,
                 format!("DeepSeek Fetch returned invalid JSON: {error}"),
             )
         })?;
-        if !status.is_success() {
-            let message = payload
-                .pointer("/error/message")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown error");
-            let retryable = matches!(status_code, 408 | 429 | 500..=599);
-            return Err((
-                retryable,
-                format!("DeepSeek Fetch HTTP {status_code}: {message}"),
-            ));
-        }
         let content = payload
             .get("content")
             .and_then(serde_json::Value::as_str)
@@ -173,6 +179,45 @@ impl DeepSeekSource {
             source_truncated,
         })
     }
+
+    /// A bounded, single-line error message. A JSON `error.message` is
+    /// preferred; HTML or plain text is sanitised and capped so a gateway page
+    /// cannot flood the caller or the logs.
+    fn error_message(bytes: &[u8]) -> String {
+        if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(bytes) {
+            if let Some(message) = payload
+                .pointer("/error/message")
+                .and_then(serde_json::Value::as_str)
+            {
+                return Self::sanitize_message(message);
+            }
+        }
+        let text = String::from_utf8_lossy(bytes);
+        let message = Self::sanitize_message(&text);
+        if message.is_empty() {
+            "no error body".to_string()
+        } else {
+            message
+        }
+    }
+
+    fn sanitize_message(text: &str) -> String {
+        text.chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(200)
+            .collect()
+    }
 }
 
 impl PageSource for DeepSeekSource {
@@ -188,8 +233,10 @@ impl PageSource for DeepSeekSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use axum::Router;
-    use axum::http::{HeaderMap, StatusCode};
+    use axum::http::{HeaderMap, StatusCode, header};
     use axum::routing::post;
 
     fn settings(base_url: String) -> DeepSeekFetchSettings {
@@ -249,13 +296,19 @@ mod tests {
     async fn reports_the_api_error_without_retrying_payment_errors() {
         use axum::Json;
 
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
         let app = Router::new().route(
             "/v1/tools/fetch",
-            post(|| async {
-                (
-                    StatusCode::PAYMENT_REQUIRED,
-                    Json(serde_json::json!({"error": {"message": "Insufficient balance"}})),
-                )
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::PAYMENT_REQUIRED,
+                        Json(serde_json::json!({"error": {"message": "Insufficient balance"}})),
+                    )
+                }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -273,6 +326,115 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("402"), "{error}");
         assert!(error.contains("Insufficient balance"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retries_non_json_5xx_before_returning_the_successful_page() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let app = Router::new().route(
+            "/v1/tools/fetch",
+            post(move || {
+                let counter = counter.clone();
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            [(header::CONTENT_TYPE, "text/html")],
+                            "<html>bad gateway</html>".to_string(),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/json")],
+                            r#"{"content":"recovered"}"#.to_string(),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source =
+            DeepSeekSource::from_settings(&settings(base_url), 5.0, &Outgoing::default()).unwrap();
+        let page = source
+            .fetch(
+                &reqwest::Url::parse("https://example.com/article").unwrap(),
+                100,
+            )
+            .await
+            .expect("the retry should succeed");
+        assert_eq!(&*page.text, "recovered");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_follow_redirects_from_the_api_endpoint() {
+        let private_hits = Arc::new(AtomicUsize::new(0));
+        let private_counter = private_hits.clone();
+        let private_app = Router::new().fallback(move || {
+            let private_counter = private_counter.clone();
+            async move {
+                private_counter.fetch_add(1, Ordering::SeqCst);
+                "private"
+            }
+        });
+        let private_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let private_address = private_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(private_listener, private_app).await.unwrap() });
+
+        let redirect_target = format!("http://{private_address}/secret");
+        let app = Router::new().route(
+            "/v1/tools/fetch",
+            post(move || {
+                let redirect_target = redirect_target.clone();
+                async move { (StatusCode::FOUND, [(header::LOCATION, redirect_target)], "") }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source =
+            DeepSeekSource::from_settings(&settings(base_url), 5.0, &Outgoing::default()).unwrap();
+        let error = source
+            .fetch(
+                &reqwest::Url::parse("https://example.com/article").unwrap(),
+                100,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("302"), "{error}");
+        assert_eq!(
+            private_hits.load(Ordering::SeqCst),
+            0,
+            "the API client must not follow a redirect to a private listener"
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_and_out_of_range_timeouts() {
+        for timeout in [
+            0.0,
+            -1.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::MAX,
+        ] {
+            assert!(
+                DeepSeekSource::from_settings(
+                    &settings("https://api.deepseek.com".into()),
+                    timeout,
+                    &Outgoing::default(),
+                )
+                .is_err(),
+                "fetch timeout {timeout} must be rejected"
+            );
+        }
     }
 
     #[test]
