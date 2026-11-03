@@ -373,46 +373,52 @@ mod tests {
 
     #[tokio::test]
     async fn does_not_follow_redirects_from_the_api_endpoint() {
-        let private_hits = Arc::new(AtomicUsize::new(0));
-        let private_counter = private_hits.clone();
-        let private_app = Router::new().fallback(move || {
-            let private_counter = private_counter.clone();
-            async move {
-                private_counter.fetch_add(1, Ordering::SeqCst);
-                "private"
-            }
-        });
-        let private_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let private_address = private_listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(private_listener, private_app).await.unwrap() });
+        for redirect_status in [StatusCode::FOUND, StatusCode::TEMPORARY_REDIRECT] {
+            let private_hits = Arc::new(AtomicUsize::new(0));
+            let private_counter = private_hits.clone();
+            let private_app = Router::new().fallback(move || {
+                let private_counter = private_counter.clone();
+                async move {
+                    private_counter.fetch_add(1, Ordering::SeqCst);
+                    "owned-private-target"
+                }
+            });
+            let private_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let private_address = private_listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(private_listener, private_app).await.unwrap() });
 
-        let redirect_target = format!("http://{private_address}/secret");
-        let app = Router::new().route(
-            "/v1/tools/fetch",
-            post(move || {
-                let redirect_target = redirect_target.clone();
-                async move { (StatusCode::FOUND, [(header::LOCATION, redirect_target)], "") }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let redirect_target = format!("http://{private_address}/secret");
+            let app = Router::new().route(
+                "/v1/tools/fetch",
+                post(move || {
+                    let redirect_target = redirect_target.clone();
+                    async move { (redirect_status, [(header::LOCATION, redirect_target)], "") }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        let source =
-            DeepSeekSource::from_settings(&settings(base_url), 5.0, &Outgoing::default()).unwrap();
-        let error = source
-            .fetch(
-                &reqwest::Url::parse("https://example.com/article").unwrap(),
-                100,
-            )
-            .await
-            .unwrap_err();
-        assert!(error.contains("302"), "{error}");
-        assert_eq!(
-            private_hits.load(Ordering::SeqCst),
-            0,
-            "the API client must not follow a redirect to a private listener"
-        );
+            let source =
+                DeepSeekSource::from_settings(&settings(base_url), 5.0, &Outgoing::default())
+                    .unwrap();
+            let error = source
+                .fetch(
+                    &reqwest::Url::parse("https://example.com/article").unwrap(),
+                    100,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains(&redirect_status.as_u16().to_string()),
+                "{redirect_status}: {error}"
+            );
+            assert_eq!(
+                private_hits.load(Ordering::SeqCst),
+                0,
+                "{redirect_status}: the API client must not follow a redirect to a private listener"
+            );
+        }
     }
 
     #[test]
